@@ -1,0 +1,34 @@
+type: "orchestration"
+version: "1.0"
+pipeline:
+  metadata:
+    description: "Scheduling wrapper for Salesforce Incremental CDC pipeline. Schedule\
+      \ this pipeline to trigger CDC extractions."
+    origin: "maia-37752454-bfb9-4018-a158-74729f2229da"
+  components:
+    Start:
+      type: "start"
+      transitions:
+        unconditional:
+        - "Run Salesforce CDC Loader"
+      parameters:
+        componentName: "Start"
+    Run Salesforce CDC Loader:
+      type: "run-orchestration"
+      parameters:
+        componentName: "Run Salesforce CDC Loader"
+        orchestrationJob: "salesforce_incremental_cdc"
+        setScalarVariables:
+        setGridVariables:
+design:
+  components:
+    Start:
+      position:
+        x: 0
+        "y": 0
+      tempMetlId:
+    Run Salesforce CDC Loader:
+      position:
+        x: 160
+        "y": 0
+      tempMetlId:

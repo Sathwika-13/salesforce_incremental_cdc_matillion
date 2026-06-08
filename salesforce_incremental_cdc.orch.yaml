@@ -1,0 +1,233 @@
+type: "orchestration"
+version: "1.0"
+pipeline:
+  metadata:
+    description: "Salesforce Incremental CDC Pipeline. Extracts Accounts and Opportunities\
+      \       from Salesforce using LastModifiedDate watermark, stages into Snowflake,\
+      \       and performs MERGE upsert into target tables. Demonstrates modular connector\
+      \       usage, high-watermark CDC pattern, and parallel entity extraction."
+    origin: "maia-37752454-bfb9-4018-a158-74729f2229da"
+  components:
+    Start:
+      type: "start"
+      transitions:
+        unconditional:
+        - "Get Watermarks"
+      parameters:
+        componentName: "Start"
+    Get Watermarks:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Extract Accounts"
+        - "Extract Opportunities"
+      parameters:
+        componentName: "Get Watermarks"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Read high watermarks for each Salesforce entity
+          SET v_hwm_accounts = (
+            SELECT COALESCE(
+              (SELECT TO_VARCHAR("HIGH_WATERMARK", 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
+               FROM "${v_database}"."SALESFORCE"."CDC_WATERMARKS"
+               WHERE "PIPELINE_NAME" = '${v_pipeline_name}'
+                 AND "ENTITY" = 'Account'),
+              '2000-01-01T00:00:00.000Z'
+            )
+          );
+          SET v_hwm_opportunities = (
+            SELECT COALESCE(
+              (SELECT TO_VARCHAR("HIGH_WATERMARK", 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
+               FROM "${v_database}"."SALESFORCE"."CDC_WATERMARKS"
+               WHERE "PIPELINE_NAME" = '${v_pipeline_name}'
+                 AND "ENTITY" = 'Opportunity'),
+              '2000-01-01T00:00:00.000Z'
+            )
+          );
+        declareSqlVariables: "Include selected"
+        variablesToInclude:
+        - "v_hwm_accounts"
+        - "v_hwm_opportunities"
+        - "v_pipeline_name"
+    Extract Accounts:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "And"
+      parameters:
+        componentName: "Extract Accounts"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Simulates Salesforce SOQL extraction with watermark filter
+          -- In production, replace with Salesforce Input connector
+          -- SOQL: SELECT Id, Name, Industry, Type, BillingCountry, LastModifiedDate
+          --       FROM Account WHERE LastModifiedDate > ${v_hwm_accounts}
+          MERGE INTO "${v_database}"."SALESFORCE"."STG_ACCOUNTS" AS tgt
+          USING (
+            SELECT * FROM "${v_database}"."SALESFORCE"."RAW_ACCOUNTS"
+            WHERE "LAST_MODIFIED_DATE" > '${v_hwm_accounts}'::TIMESTAMP_TZ
+          ) AS src
+          ON tgt."ID" = src."ID"
+          WHEN MATCHED THEN UPDATE SET
+            tgt."NAME" = src."NAME",
+            tgt."INDUSTRY" = src."INDUSTRY",
+            tgt."TYPE" = src."TYPE",
+            tgt."BILLING_COUNTRY" = src."BILLING_COUNTRY",
+            tgt."LAST_MODIFIED_DATE" = src."LAST_MODIFIED_DATE",
+            tgt."_ETL_UPDATED_AT" = CURRENT_TIMESTAMP()
+          WHEN NOT MATCHED THEN INSERT (
+            "ID", "NAME", "INDUSTRY", "TYPE", "BILLING_COUNTRY",
+            "LAST_MODIFIED_DATE", "_ETL_LOADED_AT", "_ETL_UPDATED_AT"
+          ) VALUES (
+            src."ID", src."NAME", src."INDUSTRY", src."TYPE", src."BILLING_COUNTRY",
+            src."LAST_MODIFIED_DATE", CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+          );
+    Extract Opportunities:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "And"
+      parameters:
+        componentName: "Extract Opportunities"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Simulates Salesforce SOQL extraction with watermark filter
+          -- SOQL: SELECT Id, Name, StageName, Amount, CloseDate, AccountId, LastModifiedDate
+          --       FROM Opportunity WHERE LastModifiedDate > ${v_hwm_opportunities}
+          MERGE INTO "${v_database}"."SALESFORCE"."STG_OPPORTUNITIES" AS tgt
+          USING (
+            SELECT * FROM "${v_database}"."SALESFORCE"."RAW_OPPORTUNITIES"
+            WHERE "LAST_MODIFIED_DATE" > '${v_hwm_opportunities}'::TIMESTAMP_TZ
+          ) AS src
+          ON tgt."ID" = src."ID"
+          WHEN MATCHED THEN UPDATE SET
+            tgt."NAME" = src."NAME",
+            tgt."STAGE_NAME" = src."STAGE_NAME",
+            tgt."AMOUNT" = src."AMOUNT",
+            tgt."CLOSE_DATE" = src."CLOSE_DATE",
+            tgt."ACCOUNT_ID" = src."ACCOUNT_ID",
+            tgt."LAST_MODIFIED_DATE" = src."LAST_MODIFIED_DATE",
+            tgt."_ETL_UPDATED_AT" = CURRENT_TIMESTAMP()
+          WHEN NOT MATCHED THEN INSERT (
+            "ID", "NAME", "STAGE_NAME", "AMOUNT", "CLOSE_DATE",
+            "ACCOUNT_ID", "LAST_MODIFIED_DATE", "_ETL_LOADED_AT", "_ETL_UPDATED_AT"
+          ) VALUES (
+            src."ID", src."NAME", src."STAGE_NAME", src."AMOUNT", src."CLOSE_DATE",
+            src."ACCOUNT_ID", src."LAST_MODIFIED_DATE", CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+          );
+    And:
+      type: "and"
+      transitions:
+        unconditional:
+        - "Advance Watermarks"
+      parameters:
+        componentName: "And"
+    Advance Watermarks:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Log Success"
+      parameters:
+        componentName: "Advance Watermarks"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Advance Account watermark to max LastModifiedDate in staging
+          MERGE INTO "${v_database}"."SALESFORCE"."CDC_WATERMARKS" AS tgt
+          USING (
+            SELECT '${v_pipeline_name}' AS PIPELINE_NAME, 'Account' AS ENTITY,
+                   MAX("LAST_MODIFIED_DATE") AS HIGH_WATERMARK
+            FROM "${v_database}"."SALESFORCE"."STG_ACCOUNTS"
+            HAVING COUNT(*) > 0
+          ) AS src
+          ON tgt."PIPELINE_NAME" = src.PIPELINE_NAME AND tgt."ENTITY" = src.ENTITY
+          WHEN MATCHED THEN UPDATE SET tgt."HIGH_WATERMARK" = src.HIGH_WATERMARK, tgt."UPDATED_AT" = CURRENT_TIMESTAMP()
+          WHEN NOT MATCHED THEN INSERT ("PIPELINE_NAME", "ENTITY", "HIGH_WATERMARK", "UPDATED_AT")
+            VALUES (src.PIPELINE_NAME, src.ENTITY, src.HIGH_WATERMARK, CURRENT_TIMESTAMP());
+
+          -- Advance Opportunity watermark
+          MERGE INTO "${v_database}"."SALESFORCE"."CDC_WATERMARKS" AS tgt
+          USING (
+            SELECT '${v_pipeline_name}' AS PIPELINE_NAME, 'Opportunity' AS ENTITY,
+                   MAX("LAST_MODIFIED_DATE") AS HIGH_WATERMARK
+            FROM "${v_database}"."SALESFORCE"."STG_OPPORTUNITIES"
+            HAVING COUNT(*) > 0
+          ) AS src
+          ON tgt."PIPELINE_NAME" = src.PIPELINE_NAME AND tgt."ENTITY" = src.ENTITY
+          WHEN MATCHED THEN UPDATE SET tgt."HIGH_WATERMARK" = src.HIGH_WATERMARK, tgt."UPDATED_AT" = CURRENT_TIMESTAMP()
+          WHEN NOT MATCHED THEN INSERT ("PIPELINE_NAME", "ENTITY", "HIGH_WATERMARK", "UPDATED_AT")
+            VALUES (src.PIPELINE_NAME, src.ENTITY, src.HIGH_WATERMARK, CURRENT_TIMESTAMP());
+        declareSqlVariables: "Include selected"
+        variablesToInclude:
+        - "v_pipeline_name"
+    Log Success:
+      type: "sql-executor"
+      parameters:
+        componentName: "Log Success"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          INSERT INTO "${v_database}"."SALESFORCE"."ETL_AUDIT_LOG" ("PIPELINE_NAME", "STATUS", "COMPLETED_AT", "MESSAGE")
+          SELECT '${v_pipeline_name}', 'SUCCESS', CURRENT_TIMESTAMP(), 'Incremental CDC completed for Accounts and Opportunities';
+  variables:
+    v_pipeline_name:
+      metadata:
+        type: "TEXT"
+        description: "Pipeline identifier for watermark tracking"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "Salesforce_Incremental_CDC"
+    v_hwm_accounts:
+      metadata:
+        type: "TEXT"
+        description: "High watermark for Accounts (LastModifiedDate)"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "2000-01-01T00:00:00.000Z"
+    v_hwm_opportunities:
+      metadata:
+        type: "TEXT"
+        description: "High watermark for Opportunities (LastModifiedDate)"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "2000-01-01T00:00:00.000Z"
+design:
+  components:
+    Start:
+      position:
+        x: 0
+        "y": 0
+      tempMetlId:
+    Get Watermarks:
+      position:
+        x: 200
+        "y": 0
+      tempMetlId:
+    Extract Accounts:
+      position:
+        x: 450
+        "y": -80
+      tempMetlId:
+    Extract Opportunities:
+      position:
+        x: 450
+        "y": 80
+      tempMetlId:
+    And:
+      position:
+        x: 700
+        "y": 0
+      tempMetlId:
+    Advance Watermarks:
+      position:
+        x: 900
+        "y": 0
+      tempMetlId:
+    Log Success:
+      position:
+        x: 1100
+        "y": 0
+      tempMetlId:
